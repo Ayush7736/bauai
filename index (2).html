@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Luna — Voice-only Emotion AI</title>
+<style>
+  :root{
+    --bg:#020617; --accent:#7c3aed; --muted:#9aa4b2;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;color:#e6eef6;background:var(--bg)}
+  /* Fullscreen reaction video */
+  #reactionVideo{
+    position:fixed;inset:0;width:100%;height:100%;object-fit:cover;z-index:0;background:#000;
+  }
+  /* Control panel */
+  .ui{
+    position:fixed;right:18px;bottom:18px;z-index:40;background:rgba(6,10,20,0.55);
+    border:1px solid rgba(255,255,255,0.04);backdrop-filter:blur(6px);padding:12px;border-radius:12px;
+    box-shadow:0 10px 30px rgba(0,0,0,0.6);display:flex;flex-direction:column;gap:8px;width:260px;
+  }
+  .title{font-weight:700;font-size:15px}
+  .subtitle{font-size:12px;color:var(--muted)}
+  .row{display:flex;gap:8px;align-items:center}
+  .btn{background:linear-gradient(180deg,#0b1530,#071022);border:1px solid rgba(255,255,255,0.03);color:#e6eef6;padding:10px;border-radius:10px;cursor:pointer}
+  .btn.big{font-weight:700;padding:12px 14px}
+  .btn.on{background:linear-gradient(90deg,#10b981,#059669)}
+  .status{font-size:13px;color:var(--muted)}
+  .chip{padding:6px 8px;border-radius:999px;background:rgba(255,255,255,0.02);font-size:13px;border:1px solid rgba(255,255,255,0.02)}
+  .small{font-size:13px;color:var(--muted)}
+  .centerHint{position:fixed;left:50%;transform:translateX(-50%);bottom:38px;z-index:30;background:rgba(0,0,0,0.45);padding:8px 12px;border-radius:999px;border:1px solid rgba(255,255,255,0.03);color:var(--muted)}
+</style>
+</head>
+<body>
+
+<!-- Reaction video (full background) -->
+<video id="reactionVideo" playsinline autoplay muted></video>
+
+<!-- Simple UI -->
+<div class="ui" id="uiPanel">
+  <div>
+    <div class="title">Luna — Voice Assistant</div>
+    <div class="subtitle">Voice-only. Mic ON = always listening. Reaction video plays full-screen.</div>
+  </div>
+
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <div class="small">Mic</div>
+      <div id="micStatus" class="chip">Initializing...</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end">
+      <button id="micBtn" class="btn big">Mic: —</button>
+      <button id="stopAudioBtn" class="btn">Stop Audio</button>
+    </div>
+  </div>
+
+  <div class="row" style="justify-content:space-between">
+    <div class="small">Auto TTS</div>
+    <label class="chip"><input id="autoTts" type="checkbox" checked style="margin-right:8px">ON</label>
+  </div>
+
+  <div class="row" style="justify-content:space-between">
+    <div class="small">Use Gemini emotion</div>
+    <label class="chip"><input id="useGeminiEmotion" type="checkbox" style="margin-right:8px">OFF</label>
+  </div>
+
+  <div class="row" style="justify-content:space-between">
+    <div class="small">Status</div>
+    <div id="statusBadge" class="chip">Idle</div>
+  </div>
+
+  <div style="font-size:12px;color:var(--muted);margin-top:6px">
+    Tips: click Mic to pause for privacy. Videos: /videos/{angry,sad,happy,love,blink,wakeup,confuse}.mp4
+  </div>
+</div>
+
+<div class="centerHint" id="centerHint">Say something to Luna or click Mic to start.</div>
+
+<script>
+/* ======= Configuration & prompts ======= */
+const STARTER_PROMPT = `You are "Luna", a friendly, emotionally-aware AI assistant who replies with warmth and clarity. You interpret user tone from text and respond empathetically. Keep replies concise, helpful, and polite. Always adapt your tone to the user’s emotion (angry → calm, sad → comforting, happy → upbeat, love → affectionate).`;
+
+// mapping of detected emotions to video files (place in /videos/)
+const REACTION_MAP = {
+  angry: '/videos/angry.mp4',
+  sad: '/videos/sad.mp4',
+  happy: '/videos/happy.mp4',
+  love: '/videos/love.mp4',
+  blink: '/videos/blink.mp4',
+  wakeup: '/videos/wakeup.mp4',
+  confuse: '/videos/confuse.mp4',
+  default: '/videos/default.mp4'
+};
+
+/* ======= Elements & state ======= */
+const reactionVideo = document.getElementById('reactionVideo');
+const micBtn = document.getElementById('micBtn');
+const micStatus = document.getElementById('micStatus');
+const statusBadge = document.getElementById('statusBadge');
+const centerHint = document.getElementById('centerHint');
+const stopAudioBtn = document.getElementById('stopAudioBtn');
+const autoTtsCheckbox = document.getElementById('autoTts');
+const useGeminiEmotion = document.getElementById('useGeminiEmotion');
+
+let recognition = null;
+let listening = true;
+let convoHistory = [];
+let lastDetectedEmotion = 'default';
+
+/* ======= Helpers ======= */
+function setStatus(s) { statusBadge.textContent = s; }
+function setMicStatus(text) { micStatus.textContent = text; }
+function playReactionFor(label) {
+  const src = REACTION_MAP[label] || REACTION_MAP.default;
+  reactionVideo.src = src;
+  reactionVideo.muted = true; // keep video muted to avoid clashing with TTS
+  reactionVideo.currentTime = 0;
+  reactionVideo.play().catch(()=>{});
+  lastDetectedEmotion = label;
+  centerHint.textContent = `Detected: ${label}`;
+}
+function stopReaction() {
+  reactionVideo.pause(); reactionVideo.currentTime = 0;
+  centerHint.textContent = 'Say something to Luna or click Mic to start.';
+}
+
+/* ======= Text emotion heuristics (simple) ======= */
+function detectEmotionFromText(text){
+  if(!text) return 'default';
+  const t = text.toLowerCase();
+  const contains = (arr)=>arr.some(w=>t.includes(w));
+  const happy = ['happy','glad','yay','😊','😁','lol','😂','amazing','awesome'];
+  const sad = ['sad','unhappy','cry','😭','😢','depressed','miserable'];
+  const angry = ['angry','mad','furious','wtf','😡','hate','annoyed','stfu'];
+  const love = ['love','luv','❤️','😍','i love','ily','adore'];
+  const wake = ['wake','awake','good morning','morning','woke'];
+  const confuse = ['confused','idk','dont know','?','how','what','why','huh'];
+  if(text.trim().length<=3 && /^[.]+$/.test(text.trim())) return 'blink';
+  if(contains(angry)) return 'angry';
+  if(contains(sad)) return 'sad';
+  if(contains(love)) return 'love';
+  if(contains(happy)) return 'happy';
+  if(contains(wake)) return 'wakeup';
+  if(contains(confuse) || (text.includes('?'))) return 'confuse';
+  return 'default';
+}
+
+/* ======= TTS (browser fallback) ======= */
+function speakBrowser(text){
+  if(!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'en-US';
+  u.rate = 1.0;
+  // adjust pitch/voice slightly by emotion
+  if(lastDetectedEmotion === 'sad') u.pitch = 0.85;
+  else if(lastDetectedEmotion === 'angry') u.pitch = 0.95;
+  else if(lastDetectedEmotion === 'happy') u.pitch = 1.05;
+  else if(lastDetectedEmotion === 'love') u.pitch = 1.15;
+  window.speechSynthesis.speak(u);
+}
+/* optional server TTS (use if you implement /api/tts) */
+async function speakServerTts(text){
+  try {
+    const res = await fetch('/api/tts', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    if(!res.ok) throw new Error('TTS failed');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = new Audio(url); a.play().catch(()=>{});
+  } catch(e){ console.warn('Server TTS failed, using browser TTS', e); speakBrowser(text); }
+}
+
+/* ======= Server proxies (placeholders) ======= */
+async function callSerp(q){
+  try {
+    const r = await fetch('/api/serp?q=' + encodeURIComponent(q));
+    if(!r.ok) return null;
+    return await r.json();
+  } catch(e) { console.warn('Serp failed', e); return null; }
+}
+async function callGemini(payload){
+  // POST { prompt, history, research? }
+  try {
+    const r = await fetch('/api/gemini', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(!r.ok) {
+      const txt = await r.text();
+      throw new Error(txt || 'Gemini failed');
+    }
+    return await r.json();
+  } catch(e) {
+    console.warn('Gemini call failed', e);
+    return { reply: "Sorry, server unavailable." };
+  }
+}
+
+/* ======= Conversation flow (STT -> detect -> research -> Gemini -> TTS) ======= */
+async function handleUserUtterance(text){
+  setStatus('Processing…');
+  // local emotion first
+  let emotion = detectEmotionFromText(text);
+
+  // Optionally call Gemini to classify emotion
+  if(useGeminiEmotion.checked){
+    setStatus('Classifying emotion (Gemini)...');
+    try {
+      const emoRes = await callGemini({ prompt: `Classify this text into one of: angry, sad, happy, love, blink, wakeup, confuse, default. Return JSON: { "label":"<one>" }.\n\nText:\n"""${text}"""`, history: [] });
+      if(emoRes?.inferredEmotion) emotion = emoRes.inferredEmotion;
+      else if(emoRes?.reply && typeof emoRes.reply === 'string' && emoRes.reply.trim()) {
+        // try a simple label parse
+        const lab = emoRes.reply.trim().toLowerCase().match(/(angry|sad|happy|love|blink|wakeup|confuse|default)/);
+        if(lab) emotion = lab[0];
+      }
+    } catch(e){ console.warn(e); }
+  }
+
+  // play visual reaction
+  playReactionFor(emotion);
+
+  // research via serp for richer answers (you can turn this on server-side if you prefer)
+  const research = await callSerp(text);
+
+  // Build Gemini prompt using starter prompt + user text + optional SERP summary
+  const prompt = STARTER_PROMPT + "\n\nUser: " + text + (research ? ("\n\nSearchResults: " + JSON.stringify(research).slice(0,2000)) : "");
+
+  // send to Gemini proxy
+  setStatus('Asking Gemini…');
+  const gem = await callGemini({ prompt, history: convoHistory, research });
+  const reply = gem.reply || "Sorry, I couldn't produce an answer right now.";
+  if(gem.inferredEmotion) {
+    // use server's inferredEmotion if provided
+    playReactionFor(gem.inferredEmotion);
+  }
+
+  // store in short history
+  convoHistory.push({ role:'user', content:text });
+  convoHistory.push({ role:'assistant', content:reply });
+
+  setStatus('Speaking…');
+
+  // TTS: prefer server TTS if implemented; fallback to browser
+  if(autoTtsCheckbox.checked){
+    try {
+      await speakServerTts(reply); // will fallback internally if fails
+    } catch(e){
+      speakBrowser(reply);
+    }
+  }
+
+  setStatus('Idle');
+}
+
+/* ======= Initialize STT (continuous) ======= */
+function initRecognition(){
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SpeechRecognition) {
+    setMicStatus('Not supported');
+    micBtn.disabled = true;
+    setStatus('STT not supported');
+    return null;
+  }
+  const r = new SpeechRecognition();
+  r.continuous = true;
+  r.interimResults = true;
+  r.lang = 'en-US';
+  let interim = '';
+  r.onstart = () => { setMicStatus('Listening'); micBtn.classList.add('on'); micBtn.textContent = 'Mic: ON (click to pause)'; setStatus('Listening'); };
+  r.onend = () => {
+    setMicStatus('Idle');
+    micBtn.classList.remove('on'); micBtn.textContent = 'Mic: OFF (click to resume)';
+    // if user hasn't paused explicitly, restart
+    if(listening) {
+      try { r.start(); } catch(e) { console.warn(e); }
+    }
+  };
+  r.onerror = (e) => { console.warn('STT error', e); setStatus('STT error'); };
+  r.onresult = (ev) => {
+    interim = '';
+    let final = '';
+    for(let i = ev.resultIndex; i < ev.results.length; ++i){
+      const res = ev.results[i];
+      if(res.isFinal) final += res[0].transcript;
+      else interim += res[0].transcript;
+    }
+    // show a quick hint of transcripts
+    centerHint.textContent = interim ? interim : 'Listening…';
+    // send final when punctuation or longer chunk
+    if(final && final.trim().length>0){
+      // simple heuristic: if final ends with punctuation or long enough
+      const trimmed = final.trim();
+      if(/[.?!]$/.test(trimmed) || trimmed.length > 6) {
+        handleUserUtterance(trimmed);
+      }
+    }
+  };
+  try { r.start(); } catch(e){ console.warn(e); }
+  return r;
+}
+
+/* ======= UI wiring ======= */
+micBtn.addEventListener('click', ()=>{
+  listening = !listening;
+  if(listening){
+    if(!recognition) recognition = initRecognition();
+    else try { recognition.start(); } catch(e){}
+    micBtn.classList.add('on'); micBtn.textContent = 'Mic: ON (click to pause)';
+    setMicStatus('Listening');
+  } else {
+    if(recognition) recognition.stop();
+    micBtn.classList.remove('on'); micBtn.textContent = 'Mic: OFF (click to resume)';
+    setMicStatus('Paused');
+    setStatus('Idle');
+    centerHint.textContent = 'Mic paused — click to resume.';
+  }
+});
+
+stopAudioBtn.addEventListener('click', ()=>{
+  if('speechSynthesis' in window) window.speechSynthesis.cancel();
+  // stop server audio is not handled here (server should return audio blob)
+  setStatus('Audio stopped');
+});
+
+reactionVideo.addEventListener('ended', ()=>{
+  // loop a subtle short fade: keep playing default background when ended
+  reactionVideo.currentTime = 0;
+  reactionVideo.play().catch(()=>{});
+});
+
+/* ======= Starter prompt seed ======= */
+async function seedStarter(){
+  try {
+    await callGemini({ prompt: STARTER_PROMPT, history: [] });
+  } catch(e){ /* ignore */ }
+}
+
+/* ======= Start everything ======= */
+(function boot(){
+  setStatus('Booting…');
+  reactionVideo.src = REACTION_MAP.default || '';
+  reactionVideo.muted = true;
+  reactionVideo.loop = true;
+  reactionVideo.play().catch(()=>{});
+  // initialize STT
+  recognition = initRecognition();
+  seedStarter();
+  setTimeout(()=>{ setStatus('Idle'); setMicStatus('Initializing complete'); centerHint.textContent = 'Speak to Luna — she is listening.' }, 600);
+})();
+</script>
+</body>
+</html>
